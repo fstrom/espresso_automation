@@ -1,0 +1,318 @@
+#include <Arduino.h>
+#include <Ultrasonic.h>
+#include <PID_v1.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Pin Definitions
+#define ULTRASONIC_TRIGGER_PIN 12
+#define ULTRASONIC_ECHO_PIN 13
+#define TEMP_SENSOR_PIN 34   // Pin 34 for the 10k NTC thermistor
+#define SSR_PIN 26
+#define OLED_RESET -1
+#define MENU_RETURN_PIN 32
+#define MENU_SELECT_PIN 33
+#define MENU_NEXT_PIN 25
+#define MENU_UP_PIN 14
+
+// OLED I2C Address
+#define SSD1306_I2C_ADDRESS 0x3C
+
+// Debounce interval for buttons (milliseconds)
+#define DEBOUNCE_INTERVAL 500
+
+// Ultrasonic Sensor Setup
+Ultrasonic ultrasonic(ULTRASONIC_TRIGGER_PIN, ULTRASONIC_ECHO_PIN);
+
+// PID Setup
+double setpoint = 95.0;
+double input = 0.0;
+double output = 0.0;
+double Kp = 2.0, Ki = 5.0, Kd = 1.0;
+PID boilerPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+
+// OLED Display Setup
+Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
+
+// Menu Variables
+int menuIndex = 0;
+const int menuSize = 4;
+const char* menuItems[menuSize] = {
+  "Normal Operation",
+  "Set Water Temp.",
+  "Set Heater PIDs",
+  "Calibrate Water Level"
+};
+
+// Button state tracking
+unsigned long lastButtonPressTime[4] = {0, 0, 0, 0};
+bool buttonPressed[4] = {false, false, false, false};
+
+// Hysteresis thresholds for SSR control
+#define TURN_ON_THRESHOLD 150
+#define TURN_OFF_THRESHOLD 100
+
+// Mode flag to track if we are in Normal Operation or Menu
+bool inNormalOperation = false;
+
+// Thermistor specific constants for 10k NTC
+#define THERMISTOR_RESISTANCE 10000.0  // Resistance of thermistor at 25°C (10k ohm)
+#define SERIES_RESISTOR 10000.0        // Resistor used in the voltage divider (10k ohm)
+
+// Steinhart-Hart Equation coefficients for 10k NTC thermistor (common values)
+#define A 0.001129148
+#define B 0.000234125
+#define C 0.0000000876741
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SSD1306_I2C_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+
+  // Initialize buttons
+  pinMode(MENU_RETURN_PIN, INPUT_PULLUP);
+  pinMode(MENU_SELECT_PIN, INPUT_PULLUP);
+  pinMode(MENU_NEXT_PIN, INPUT_PULLUP);
+  pinMode(SSR_PIN, OUTPUT); // SSR control pin
+
+  // Initialize PID
+  boilerPID.SetMode(AUTOMATIC);
+
+  // Show welcome message
+  displayWelcomeMessage();
+}
+
+void loop() {
+  // Check for button presses to navigate menus or perform actions
+  if (debounceButton(MENU_RETURN_PIN, 0)) {
+    if (inNormalOperation) {
+      // If in Normal Operation, go to the main menu
+      inNormalOperation = false;
+      switchToMenuScreen();
+    } else {
+      // Otherwise, handle the menu logic
+      switchToMenuScreen();
+    }
+  }
+
+  if (debounceButton(MENU_SELECT_PIN, 1)) handleMenuSelection();
+  if (debounceButton(MENU_NEXT_PIN, 2)) handleNextOption();
+
+  // Only control the heater in Normal Operation mode
+  if (inNormalOperation) {
+    // Read the current temperature from the sensor
+    input = readTemperature();
+
+    // Run PID control to compute the output
+    boilerPID.Compute();
+
+    // Control SSR based on PID output with hysteresis logic
+    if (output > TURN_ON_THRESHOLD) {
+      digitalWrite(SSR_PIN, HIGH);  // Turn on SSR (heater)
+    } else if (output < TURN_OFF_THRESHOLD) {
+      digitalWrite(SSR_PIN, LOW);   // Turn off SSR (heater)
+    }
+
+    // Display the normal operation screen
+    displayNormalOperation();
+  }
+
+  delay(1000); // Control loop delay (adjust based on desired update frequency)
+}
+
+void displayWelcomeMessage() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print("Welcome to Smart");
+  display.setCursor(0, 10);
+  display.print("Espresso Machine");
+  display.display();
+  delay(2000);
+  switchToMenuScreen(); // Start in the main menu
+}
+
+bool debounceButton(int buttonPin, int buttonIndex) {
+  unsigned long currentTime = millis();
+  bool currentState = !digitalRead(buttonPin); // Active LOW
+
+  if (currentState && !buttonPressed[buttonIndex]) {
+    if (currentTime - lastButtonPressTime[buttonIndex] > DEBOUNCE_INTERVAL) {
+      buttonPressed[buttonIndex] = true;
+      lastButtonPressTime[buttonIndex] = currentTime;
+      return true;
+    }
+  } else if (!currentState) {
+    buttonPressed[buttonIndex] = false;
+  }
+
+  return false;
+}
+
+void displayNormalOperation() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print("Normal Operation");
+
+  // Display current boiler temperature and target temperature
+  display.setCursor(0, 10);
+  display.print("Boiler Temp: ");
+  display.print(input);
+  display.print(" C");
+
+  display.setCursor(0, 20);
+  display.print("Set Temp: ");
+  display.print(setpoint);
+  display.print(" C");
+
+  display.display();
+}
+
+void switchToMenuScreen() {
+  if (inNormalOperation) {
+    displayNormalOperation();
+  } else {
+    displayMenu();
+  }
+}
+
+void displayMenu() {
+  display.clearDisplay();
+  for (int i = 0; i < menuSize; i++) {
+    display.setCursor(0, i * 10);
+    if (i == menuIndex) {
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    display.print(menuItems[i]);
+  }
+  display.display();
+}
+
+void handleMenuSelection() {
+  switch (menuIndex) {
+    case 0: // Normal Operation
+      inNormalOperation = true;
+      displayNormalOperation();
+      break;
+
+    case 1: // Set Water Temp.
+      setWaterTemp();
+      break;
+
+    case 2: // Set Heater PIDs
+      setHeaterPIDs();
+      break;
+
+    case 3: // Calibrate Water Level
+      performCalibration();
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleNextOption() {
+  menuIndex++;
+  if (menuIndex >= menuSize) {
+    menuIndex = 0; // Wrap around to the first menu item
+  }
+  displayMenu();
+}
+
+void performCalibration() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Calibrate Empty Tank");
+  display.setCursor(0, 10);
+  display.print("Press Select to Save");
+  display.display();
+  while (!debounceButton(MENU_SELECT_PIN, 1)); // Wait for button press
+  float emptyLevel = ultrasonic.read(CM);
+
+  delay(500); // Wait 500ms after the first calibration step
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Calibrate 1L Water");
+  display.setCursor(0, 10);
+  display.print("Press Select to Save");
+  display.display();
+  while (!debounceButton(MENU_SELECT_PIN, 1)); // Wait for button press
+  float oneLiterLevel = ultrasonic.read(CM);
+
+  float calibrationFactor = (oneLiterLevel - emptyLevel) / 100.0;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Calibration Complete");
+  display.setCursor(0, 10);
+  display.print("Factor: ");
+  display.print(calibrationFactor, 2);
+  display.display();
+  delay(3000);
+  displayMenu(); // Return to menu
+}
+
+void setWaterTemp() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Set Water Temp");
+  display.setCursor(0, 10);
+  display.print("Press Select to Set");
+  display.display();
+  while (!debounceButton(MENU_SELECT_PIN, 1)); // Wait for button press
+  setpoint = 95.0; // Example temperature setting
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Water Temp Set to: ");
+  display.print(setpoint);
+  display.display();
+  delay(3000);
+  displayMenu(); // Return to menu
+}
+
+void setHeaterPIDs() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Set Heater PIDs");
+  display.setCursor(0, 10);
+  display.print("Adjust P, I, D values");
+  display.display();
+  Kp = 2.5; Ki = 5.5; Kd = 1.2; // Example PID values
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("PIDs Set: Kp=");
+  display.print(Kp);
+  display.setCursor(0, 10);
+  display.print("Ki=");
+  display.print(Ki);
+  display.setCursor(0, 20);
+  display.print("Kd=");
+  display.print(Kd);
+  display.display();
+  delay(3000);
+  displayMenu(); // Return to menu
+}
+
+// Function to read temperature from the 10k NTC thermistor
+float readTemperature() {
+  int sensorValue = analogRead(TEMP_SENSOR_PIN);
+  float voltage = sensorValue * (3.3 / 4095.0); // Convert to voltage (ESP32 12-bit ADC)
+
+  // Use Steinhart-Hart equation to calculate temperature (in Celsius)
+  float resistance = SERIES_RESISTOR * (3.3 / voltage - 1);
+  float temperature = 1.0 / (A + B * log(resistance) + C * pow(log(resistance), 3));
+  temperature -= 273.15; // Convert from Kelvin to Celsius
+  return temperature;
+}
